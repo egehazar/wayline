@@ -107,9 +107,26 @@ The synthetic event generator is a different concern — runs once to seed Postg
 
 ---
 
-## 8. Decisions log
+## 8. Infrastructure setup
+
+**Postgres 16 + Redis 7** (Alpine variants), run via `docker compose up -d`. Healthchecks built into compose so services report `(healthy)` only when actually ready to accept connections — matters once the api depends on them at startup.
+
+**Host port remap (5433 → 5432 for Postgres, 6380 → 6379 for Redis):**
+Another local Docker project is already bound to the default ports. Rather than disrupting that project, Wayline binds to non-default host ports. The remap is host-side only — inside each container, Postgres and Redis still listen on their own defaults (5432, 6379). Once the api joins the same Docker network, it'll talk to `postgres:5432` directly without involving host ports.
+
+**Named volumes (`postgres-data`, `redis-data`):**
+Data persists across `docker compose down`. Lets me iterate without losing seeded event data. `.gitignore` excludes those directory names in case they're ever mounted as local paths instead.
+
+**Why no api/web in compose yet:**
+Compose tracks what's real. Until those services have code that runs, adding them creates noise. They get added when each has its first working endpoint.
+
+---
+
+## 9. Decisions log
 
 Append-only. Date + decision + reasoning.
 
 - **2026-05-16** — Layout: `engine/` as submodule of `api/`, not sibling at root. Reason: only one consumer; avoids overengineering while preserving the architectural boundary in code.
 - **2026-05-16** — Stack: Polars over pandas for analysis stage. Reason: performance at 250k+ events + lazy API.
+- **2026-05-16** — Postgres 16 + Redis 7 (alpine) with in-compose healthchecks. Reason: current stable majors, small images, race-condition-safe startup.
+- **2026-05-16** — Host port remap to 5433/6380 due to collision with another local Docker project. Container internals unchanged. Reason: keep both projects runnable in parallel without coordination.
