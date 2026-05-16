@@ -1,0 +1,115 @@
+# Wayline — Engineering Notes
+
+A behavioral product intelligence engine that finds activation milestones in raw event data and turns them into testable experiment specs.
+
+---
+
+## 1. What it is (one-liner)
+
+Wayline ingests raw product event streams and automatically surfaces the activation paths, milestones, and cohort patterns that correlate with retention — then drafts experiment specs from those findings.
+
+Short version: *"It finds the 'aha moments' in product data and turns them into experiment specs."*
+
+---
+
+## 2. Why it exists
+
+The famous activation insights — Slack's "30 messages in 7 days," Facebook's "7 friends in 10 days," Dropbox's "1 file uploaded" — were all discovered manually by analysts running iterative cohort SQL. That process is slow, requires strong SQL fluency, and tends to happen once per company rather than continuously. Most teams either skip activation analysis or do it as a one-off deck that goes stale.
+
+Wayline collapses that loop. Instead of an analyst hand-crafting cohort queries, the engine mines candidate milestones from the event stream, scores each one against a retention outcome, and packages the strongest signals as experiment specs.
+
+**Differentiator vs Mixpanel/Amplitude:** those tools let you *query* behavior; Wayline *discovers* which behaviors matter.
+
+---
+
+## 3. Architecture — the four stages
+
+### Stage 1: Event ingestion & journey reconstruction (Postgres)
+Raw events (`user_id`, `event_name`, `ts`, `properties`) land in Postgres. Per-user journeys are materialized as ordered sequences with derived features: time-since-signup, session boundaries, event counts per type.
+
+### Stage 2: Cohort labeling (SQL)
+Users get an outcome label based on a retention window — e.g., `active_week_4 = true/false`. This is the ground-truth signal everything downstream is scored against.
+
+### Stage 3: Behavioral mining (Polars)
+Candidate milestones generated programmatically:
+- "did event X within Y days of signup"
+- "completed sequence A → B → C"
+- "performed event X at least N times"
+
+For each candidate, Polars computes retention lift and a statistical confidence score vs. the cohort labels. Path analysis finds common prefixes among retained vs. churned users.
+
+**Why Polars not pandas:** the milestone scan is heavy groupby/window work across the full event table. At 250k events pandas gets sluggish; Polars handles it comfortably and its lazy API keeps query plans clean.
+
+### Stage 4: LLM synthesis (OpenAI / Claude)
+Top-scoring milestones go to an LLM that drafts experiment specs:
+- Hypothesis
+- Target segment
+- Success event
+- Guardrail metrics
+- Rationale grounded in the source data
+
+**Redis** sits across stages 3 and 4 to cache expensive milestone scans and LLM outputs. That's where the "<30 seconds" claim lives.
+
+---
+
+## 4. Repo layout
+wayline/
+├── web/                  # Next.js frontend (TypeScript)
+├── api/                  # FastAPI HTTP layer — thin, routes + serialization
+│   └── engine/           # Polars analysis logic, imported by api routes
+├── data/                 # Synthetic event generator + schema docs
+├── docker-compose.yml    # Postgres, Redis, api, web — one command up
+├── .env.example
+├── .gitignore
+├── NOTES.md
+└── README.md
+
+**Why engine/ is a submodule of api/ instead of a sibling at root:**
+Only one consumer (the api). Promoting it to top-level would imply multiple services share it, which isn't true. Still gives the clean architectural answer: api routes parse input → call into engine → serialize results. Engine has no FastAPI dependency, so it's independently unit-testable against fixture event data.
+
+**Why data/ is separate:**
+The synthetic event generator is a different concern — runs once to seed Postgres. Its design is itself a talking point: the generator must inject *latent structure* (some users programmed to be more likely to retain because of specific behaviors), or no real milestones will surface.
+
+---
+
+## 5. Stack rationale
+
+| Tech | Why |
+|------|-----|
+| Next.js + TypeScript | Component model fits a dashboard UI; TS keeps the API contract honest. |
+| FastAPI | Async; Pydantic schemas mirror TS types cleanly; auto-generated docs. |
+| Polars | 5–10× faster than pandas on groupby/window ops at this scale; lazy execution. |
+| PostgreSQL | Event tables fit relational well; window functions cover most cohort SQL. |
+| Redis | Cache for milestone-scan results and LLM responses. Could queue background scans later. |
+| OpenAI / Claude | LLM synthesis stage. Choose at runtime by which env var is set. |
+| Docker | One-command local setup for db + cache + api + web. |
+
+---
+
+## 6. Defending the resume claims
+
+| Claim | What backs it |
+|-------|---------------|
+| "Processed 250k+ synthetic product events" | Generator in `data/` writes ≥250k events covering signup, onboarding, integration, purchase, sharing, return-session journeys. |
+| "Identified 12 behavioral milestones correlated with higher 4-week retention" | Engine's milestone-mining stage returns ranked milestones; generator designed so ~12 real signals exist; verify in output. |
+| "Generated experiment specs with target segments, success events, guardrail metrics" | LLM synthesis stage produces structured spec per top milestone. Persist these for the demo. |
+| "Reduced manual analysis time to <30s for cohort/path comparison reports" | Cached scans + pre-computed journey tables. Benchmark and record actual numbers here. |
+
+---
+
+## 7. Open questions (resolve as we build)
+
+- **Event schema:** what does `properties` JSONB look like per event type? Pin down before generating data.
+- **Retention definition:** active_week_4 = "any session in calendar week 4 post-signup"? Or 28-day rolling window? Pick one.
+- **Milestone candidate space:** how do we bound it? Threshold sweep over "event X done N times" — what range of N?
+- **Statistical confidence:** chi-squared, lift + sample-size threshold, or something else?
+- **LLM cost:** how many specs per run, and is each one cached?
+
+---
+
+## 8. Decisions log
+
+Append-only. Date + decision + reasoning.
+
+- **2026-05-16** — Layout: `engine/` as submodule of `api/`, not sibling at root. Reason: only one consumer; avoids overengineering while preserving the architectural boundary in code.
+- **2026-05-16** — Stack: Polars over pandas for analysis stage. Reason: performance at 250k+ events + lazy API.

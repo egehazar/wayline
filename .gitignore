@@ -1,0 +1,51 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+build/
+dist/
+.vercel
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+.vscode/
+
+# Docker volumes (if mounted locally)
+postgres-data/
+redis-data/
