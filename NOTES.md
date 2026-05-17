@@ -122,7 +122,25 @@ Compose tracks what's real. Until those services have code that runs, adding the
 
 ---
 
-## 9. Decisions log
+## 9. API service
+
+**psycopg 3 (`psycopg[binary]`):** current major Postgres driver; binary wheel avoids local compile. Sync mode for now; async swap is available later without architectural change.
+
+**Sync `def` endpoint with sync drivers:** an `async def` handler wrapping sync drivers would block the event loop. `def` runs in FastAPI's threadpool, containing the blocking per-worker. Async drivers + async handlers is a future option; no performance reason to take that on at health-check frequency.
+
+**No connection pooling on `/health`:** health checks should verify the connection-establishment path itself, not the existence of a warm pool. Pooling lands with real query endpoints when throughput justifies it.
+
+**Timeouts (2s, both libraries):** `connect_timeout=2` (psycopg); `socket_connect_timeout=2, socket_timeout=2` (redis-py). Caveat for real endpoints: psycopg's `connect_timeout` bounds connect only, not query duration — query-level bounding needs `statement_timeout` via the connection's `options=` parameter.
+
+**Error hygiene:** exceptions surface as `"error: <ExceptionClassName>"` — class name only. URLs, hosts, ports, and credentials never appear in responses.
+
+**Always-200 with `status: degraded`:** `/health` is an info endpoint, not a liveness probe. Always returns 200; `status` flips based on dependency reachability. Liveness probes use non-200 semantics — that's a separate endpoint when one is needed.
+
+**`.env` fallback:** loads `.env` if present, else `.env.example`. `load_dotenv` doesn't override existing env vars, so shell/container env wins as expected.
+
+---
+
+## 10. Decisions log
 
 Append-only. Date + decision + reasoning.
 
@@ -130,3 +148,6 @@ Append-only. Date + decision + reasoning.
 - **2026-05-16** — Stack: Polars over pandas for analysis stage. Reason: performance at 250k+ events + lazy API.
 - **2026-05-16** — Postgres 16 + Redis 7 (alpine) with in-compose healthchecks. Reason: current stable majors, small images, race-condition-safe startup.
 - **2026-05-16** — Host port remap to 5433/6380 due to collision with another local Docker project. Container internals unchanged. Reason: keep both projects runnable in parallel without coordination.
+- **2026-05-16** — psycopg 3 over 2. Reason: current major; binary wheel; sync now, async swap possible later.
+- **2026-05-16** — Sync `def` health endpoint with sync drivers. Reason: blocking contained in FastAPI's threadpool; no async drivers needed yet.
+- **2026-05-16** — `/health` always returns 200 with status="ok"|"degraded". Reason: info endpoint, not liveness probe.
