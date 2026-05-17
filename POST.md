@@ -18,7 +18,17 @@ Wayline closes that loop. The engine mines candidate milestones from raw event s
 
 ## Synthetic data — the latent-structure problem
 
-(To fill in when we design the generator. Why naive uniform-random events produce no signal; how to inject the kind of structure real product data has, so that real milestones can be discovered.)
+Naive synthetic data destroys this project. Generate events uniformly at random and every event correlates with retention at the base rate — the engine finds nothing, because there's nothing to find. Real product data has latent structure: some users are deeply invested and reveal it through specific behaviors, others are tire-kickers, and the relationship between behavior and retention is statistical, not deterministic. The engine's job is to discover the behavioral signatures of types it doesn't know exist.
+
+So the generator simulates a B2B project management tool and assigns each user one of four hidden personas: Power (15%), Activator (30%), Looker (35%), Bouncer (20%). Each persona has its own event-probability vector, timing distributions, and retention probability. The engine never queries the persona column; it sees only events and a retention label derived from events in days 21–28 post-signup. Whatever it surfaces gets validated against ground truth by joining back to persona.
+
+Two design moments worth being honest about:
+
+**Spec calibration.** The initial persona spec called for Poisson(λ=3) sessions/day for Power users in week 1, scaling down through the personas. Across 25k users over a 60-day observation window, that math projected ~1M events — well above the 250–400k target band. The choice was widen the target or recalibrate the rates. I recalibrated, preserving the two things the engine actually learns from: the persona ranking (Power > Activator > Looker > Bouncer) and the per-event-type probabilities (integration_connected at P=0.95 for Power, P=0.35 for Activator, etc.). The absolute session volume per user doesn't affect the relative behavioral signature.
+
+**Retention as an explicit gate.** The first run had Looker retention at 33% instead of the 15% target. The bug was structural: Looker's spec includes a long onboarding window (1–4 weeks), and non-retained Lookers' onboarding events were leaking into the retention check window. I made retention a Bernoulli decision at user-generation time and clipped non-retained users' events to before day 21. Real-world retention has spillover noise like this; for an evaluation testbed where we want measured retention to cleanly reflect the persona's intent, the clip is correct.
+
+After both corrections, the generator produces 370,489 events for 25,000 users in 7.2 seconds — 1.9s generating in memory, 5.3s bulk-streaming to Postgres via psycopg's `copy()`. Verifier passes all 13 sanity checks: persona distribution within 0.5pp of spec, retention rates within 1pp per persona, no orphan events. Same seed produces the same data, which matters because the engine's outputs need to be reproducible for evaluation to mean anything.
 
 ## LLM-drafted experiment specs
 

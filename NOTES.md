@@ -158,7 +158,21 @@ Compose tracks what's real. Until those services have code that runs, adding the
 
 ---
 
-## 11. Decisions log
+## 11. Synthetic generator
+
+**Bulk insert via `psycopg.cursor.copy()`:** rows generated entirely in memory, then bulk-streamed to Postgres. Generation took 1.9s; DB write took 5.3s. Row-by-row INSERT at this volume would be minutes per run instead of seconds — fast generator means fast iteration, which matters for tuning persona parameters.
+
+**Reproducibility via fixed seed (`random.seed(42)`, `np.random.seed(42)`):** same seed = same data = same engine output. Required for evaluation to be meaningful — without it, "the engine surfaced this milestone" is non-reproducible.
+
+**Idempotence via `TRUNCATE users, events RESTART IDENTITY CASCADE`:** re-running produces fresh data, not doubled-up data. Belongs at the start of every generator run.
+
+**Deviation from PERSONAS.md spec — session rate calibration.** The spec rates (Poisson(λ=3) sessions/day for Power week 1, Poisson(λ=2) for retained Power, etc.) projected ~1M events at 25k users × 60-day window, well over the 250–400k target band. Two options: widen the verify range, or recalibrate. Chose recalibration because: (a) persona rankings are preserved (Power > Activator > Looker > Bouncer), (b) per-event-type probabilities are preserved exactly (`integration_connected` P=0.95 for Power, etc.), and (c) absolute volume per user doesn't affect the relative behavioral signature the engine learns from. Calibrated values in `SESSION_RATE_WEEK1` and `SESSION_RATE_RETAINED` constants; spec values shown in inline comments for easy revisit.
+
+**Deviation from PERSONAS.md spec — retention as an explicit gate.** First pass had Looker retention at 33% (target 15%) because non-retained Lookers' long onboarding window (1–4 weeks per spec) leaked events into the retention check window (days 21–28). Refactored to sample the Bernoulli retention decision at user-generation time and clip non-retained users' events to before day 21. Real-world retention has spillover noise; this clip makes the synthetic data a clean evaluation testbed. Documented in generator module docstring.
+
+---
+
+## 12. Decisions log
 
 Append-only. Date + decision + reasoning.
 
@@ -173,3 +187,5 @@ Append-only. Date + decision + reasoning.
 - **2026-05-17** — `persona` column on users as generator ground truth + engine evaluation signal. Engine treats it as opaque. Reason: lets us validate engine outputs against known persona assignments instead of hand-waving.
 - **2026-05-17** — Raw SQL migrations + 20-line Python runner over Alembic. Reason: no ORM in use; Alembic's main features don't apply; clearer code path for this project's scale.
 - **2026-05-17** — Four-persona synthetic design (Power/Activator/Looker/Bouncer at 15/30/35/20%). Reason: enough latent structure to make milestones discoverable; enough adjacent overlap that the engine has to compute statistics, not trivially cluster.
+- **2026-05-17** — Generator session rates calibrated ~4–5× below spec to hit the 250–400k event target band. Persona rankings + per-event probabilities preserved exactly. Reason: absolute volume per user doesn't affect the behavioral signature; recalibrating beats widening the verify range.
+- **2026-05-17** — Retention sampled as explicit Bernoulli at user-generation time; non-retained users' events clipped to before day 21. Reason: prevents long-onboarding-window spillover from contaminating the retention measurement; keeps the synthetic data a clean evaluation testbed.
