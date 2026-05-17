@@ -172,7 +172,29 @@ Compose tracks what's real. Until those services have code that runs, adding the
 
 ---
 
-## 12. Decisions log
+## 12. Milestone mining engine
+
+**Architecture:** pure Python + Polars, no FastAPI dependencies. `api/engine/milestones.py` exposes `load_data`, `compute_retention`, `candidate_milestones`, `evaluate_milestone`, `mine_milestones`, `persona_dominance`. Engine is library-shaped; `api/engine/run.py` is the current CLI entry, swappable for a FastAPI endpoint later without touching the analytical core.
+
+**Candidate space:** ~37 milestone definitions across four template kinds — event-within-days (4 events × 4 windows), event-count-at-least-N (5 events × 4 counts), onboarding-step-completion (5 steps), sessions-on-distinct-days. Templates with explicit parameter sweeps keep each candidate interpretable. Full threshold sweeps or full sequence patterns would explode the space without adding actionable insight.
+
+**Filters (both must hold):**
+- `min_sample = 200` — statistical reliability; kills rare-cohort overfitting.
+- `max_share = 0.25` — specificity; kills "did anything past signup" predicates whose lift comes purely from excluding Bouncers.
+
+**Why the specificity filter exists:** first cut of the engine ranked `completed_onboarding_step_1` and `workspace_created_within_28_days` at top with 9.6× lift. Mathematically correct — those predicates exclude the 20% Bouncer cohort with 0% retention — but not actionable. A PM can't experiment on "did anything at all." The 25% specificity cap surfaces the specific behaviors PMs can target.
+
+**Scoring:** `lift = P(retain | did) / P(retain | didn't)`. `retain_didnt = 0` returns None, filtered out. No chi-squared — at 25k users with cohort sizes ≥200, p-values are effectively zero and don't discriminate; sample-size filtering catches the same failure mode (small-sample overfitting) with simpler reasoning and no multiple-comparison correction baggage.
+
+**Engine remains blind to `persona`:** `mine_milestones` queries event_name, ts, properties, user_id only. `persona_dominance` is a separate function called by `run.py` for evaluation output — it reads persona to verify engine results against ground truth. Intentional isolation so the engine works against real data where persona doesn't exist.
+
+**Performance:** 1.0s data load + 0.1s mining (44 candidates) + 0.4s for both passes (raw + actionable) + ~0.1s persona dominance = 1.6s total. Caching `mine_milestones` raw output in Redis becomes useful once LLM synthesis is layered on top — the actionable ranking is then a cheap `pl.filter()` on the cached result.
+
+**Two-table output:** Table A (raw lift, no specificity filter) verifies mechanical correctness. Table B (actionable, n_did ≤ 25% of users) is the headline ranking. Both visible in the CLI output — hiding either would obscure either how the engine works or what it's useful for.
+
+---
+
+## 13. Decisions log
 
 Append-only. Date + decision + reasoning.
 
@@ -188,4 +210,9 @@ Append-only. Date + decision + reasoning.
 - **2026-05-17** — Raw SQL migrations + 20-line Python runner over Alembic. Reason: no ORM in use; Alembic's main features don't apply; clearer code path for this project's scale.
 - **2026-05-17** — Four-persona synthetic design (Power/Activator/Looker/Bouncer at 15/30/35/20%). Reason: enough latent structure to make milestones discoverable; enough adjacent overlap that the engine has to compute statistics, not trivially cluster.
 - **2026-05-17** — Generator session rates calibrated ~4–5× below spec to hit the 250–400k event target band. Persona rankings + per-event probabilities preserved exactly. Reason: absolute volume per user doesn't affect the behavioral signature; recalibrating beats widening the verify range.
-- **2026-05-17** — Retention sampled as explicit Bernoulli at user-generation time; non-retained users' events clipped to before day 21. Reason: prevents long-onboarding-window spillover from contaminating the retention measurement; keeps the synthetic data a clean evaluation testbed.
+- **2026-05-17** — Retention sampled as explicit Bernoulli at user-generation time; non-retained users' events clipped to before day 21. Reason: prevents long-onboarding-window spillover from contaminating the retention measurement.
+- **2026-05-17** — Engine as Polars-based functional module, no FastAPI dependencies. Reason: independent testability, library-shaped for future endpoint wrapping.
+- **2026-05-17** — Hand-defined milestone templates with parameter sweeps over thresholds. Reason: interpretability matters as much as recall; uninterpretable milestones aren't actionable.
+- **2026-05-17** — Lift + minimum sample size (200) for milestone scoring over chi-squared. Reason: at 25k users, chi-squared p-values are effectively zero and don't discriminate; sample-size filtering catches small-sample noise with simpler defensibility.
+- **2026-05-17** — Specificity filter (`max_share=0.25`) added after first-cut ranking surfaced "did anything past signup" milestones at top with 9.6× lift. Reason: lift alone surfaces broad-funnel predicates that exclude Bouncers but aren't actionable; specificity cap isolates the specific behaviors PMs can target.
+- **2026-05-17** — Two-table CLI output (raw + actionable). Reason: raw verifies mechanical correctness; actionable is the headline ranking. Hiding either obscures either how the engine works or what it's useful for.

@@ -14,7 +14,25 @@ Wayline closes that loop. The engine mines candidate milestones from raw event s
 
 ## Methodology — milestone discovery
 
-(To fill in when the engine takes shape: the candidate space, the cohort labeling decision, the statistical scoring, the path analysis.)
+The engine has three stages. **Loading** pulls users and events into Polars DataFrames from Postgres — 1.0 seconds for 25,000 users and 370,489 events. **Cohort labeling** computes a binary retention label per user: did they have any event in days 21–28 post-signup? **Milestone mining** generates ~37 candidate "milestone shapes" — `did_event_X_within_Y_days`, `event_X_at_least_N_times_in_first_week`, `completed_onboarding_step_M`, `sessions_on_distinct_days_in_first_week` — and scores each one for retention lift.
+
+A first cut of the ranking surprised me. The top result wasn't `integration_connected_within_7_days` (what I'd predicted). It was `completed_onboarding_step_1` and `workspace_created_within_28_days`, tied at 9.6× lift. The mechanism was real: those broad predicates cleanly exclude the 20% Bouncer cohort whose retention is 0%, and removing a 0%-retention cohort from the denominator generates more lift than any other behavior could. The engine was working correctly. The problem was that "did anything past signup" isn't an actionable milestone — a PM can't run an experiment to nudge users toward "doing literally anything."
+
+So I added a specificity filter: a milestone counts as actionable only if it's hit by ≤ 25% of all users. That cut 15 of 39 surviving milestones — all the broad early-funnel ones — and surfaced what I'd been looking for. The actionable ranking:
+
+| Rank | Milestone | n | Lift | Power dominance |
+|---|---|---|---|---|
+| 1 | `completed_onboarding_step_5` | 6,188 | 3.37× | 60% |
+| 2 | `integration_connected_within_14_days` | 6,248 | 3.24× | 57% |
+| 3 | `integration_connected_within_7_days` | 4,936 | 3.20× | 72% |
+| 4 | `task_completed_at_least_3_in_week1` | 4,161 | 3.03× | 73% |
+| 5 | `task_created_at_least_3_in_week1` | 4,142 | 3.00× | 72% |
+
+Persona dominance validates the result against ground truth: every top-5 actionable milestone is 57–73% Power persona, with Activator second, Looker ≤1.4%, Bouncer 0%. The engine correctly isolated behaviors that discriminate *among engaged users* — not just between engaged and disengaged.
+
+One milestone deserves separate mention. `task_completed_at_least_5_in_week1` ranks #8 with the smallest cohort (1,754 users) but the highest individual retention rate (83.5%). It's a tight Power signal — completing 5+ tasks in week 1 nearly guarantees you're a deeply-engaged user. The aggregate lift is lower because the cohort is too small to move the population denominator much, but in product terms it's the most predictive single signal in the entire output.
+
+Engine wall-clock: 1.6 seconds. The `<30 seconds vs. multi-query SQL exploration` claim has room to spare — there's headroom for the LLM synthesis stage that follows.
 
 ## Synthetic data — the latent-structure problem
 
