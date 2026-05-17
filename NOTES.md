@@ -140,14 +140,36 @@ Compose tracks what's real. Until those services have code that runs, adding the
 
 ---
 
-## 10. Decisions log
+## 10. Data layer
+
+**Schema (`users` + `events`):** classic one-to-many. Single events table with `event_name` + JSONB `properties` rather than per-event-type tables — the Segment/Mixpanel/Amplitude shape. Flexible per-event fields without column proliferation; queryable via `properties->>'key'` and a GIN index if/when needed.
+
+**`persona` column as ground truth:** column exists for the *generator* and for *evaluation queries*. The engine never reads it. Without ground truth on synthetic data, "the engine works" is hand-waving — with it, we can quantitatively check whether discovered milestones correspond to the personas they should.
+
+**No `retention` column:** retention is a derived fact about behavior (events in week 4 post-signup), not an attribute of a user. Storing it would mean syncing it with the underlying events; deriving it keeps the definition in one place.
+
+**Indexes — `(user_id, ts)`, `(event_name, ts)`, `(ts)`:** journey reconstruction (dominant query), event-type cohort analysis, and pure time-range respectively. No GIN on JSONB yet — added only if profiling shows JSONB queries hot enough to justify the write-cost overhead.
+
+**Check constraints on `channel`, `plan_tier`, `persona`:** enforced at the database level. The generator can't insert invalid enum values by accident.
+
+**Raw SQL migrations over Alembic:** Alembic's main value is autogeneration from SQLAlchemy ORM models. We're not using an ORM (Polars reads SQL directly), so that value doesn't apply. A 20-line Python runner reads `api/migrations/*.sql` in lexical order, tracks applied versions in `schema_migrations`, and applies each unapplied file in its own transaction. Each migration commits separately so a midway failure doesn't roll back successful earlier files.
+
+**Generator persona design (4 personas at 15/30/35/20%):** documented separately in `data/PERSONAS.md`. The TL;DR is in section 7 of this file — latent structure is required for milestones to exist, the four-persona distribution is the structure, evaluation is via persona-dominance queries on milestone cohorts.
+
+---
+
+## 11. Decisions log
 
 Append-only. Date + decision + reasoning.
 
 - **2026-05-16** — Layout: `engine/` as submodule of `api/`, not sibling at root. Reason: only one consumer; avoids overengineering while preserving the architectural boundary in code.
 - **2026-05-16** — Stack: Polars over pandas for analysis stage. Reason: performance at 250k+ events + lazy API.
 - **2026-05-16** — Postgres 16 + Redis 7 (alpine) with in-compose healthchecks. Reason: current stable majors, small images, race-condition-safe startup.
-- **2026-05-16** — Host port remap to 5433/6380 due to collision with another local Docker project. Container internals unchanged. Reason: keep both projects runnable in parallel without coordination.
+- **2026-05-16** — Host port remap to 5433/6380 due to collision with another local Docker project. Container internals unchanged.
 - **2026-05-16** — psycopg 3 over 2. Reason: current major; binary wheel; sync now, async swap possible later.
 - **2026-05-16** — Sync `def` health endpoint with sync drivers. Reason: blocking contained in FastAPI's threadpool; no async drivers needed yet.
 - **2026-05-16** — `/health` always returns 200 with status="ok"|"degraded". Reason: info endpoint, not liveness probe.
+- **2026-05-17** — Two-table schema (users + events) with JSONB `properties` on events. Reason: standard product-analytics shape; flexible per-event-type fields without column proliferation.
+- **2026-05-17** — `persona` column on users as generator ground truth + engine evaluation signal. Engine treats it as opaque. Reason: lets us validate engine outputs against known persona assignments instead of hand-waving.
+- **2026-05-17** — Raw SQL migrations + 20-line Python runner over Alembic. Reason: no ORM in use; Alembic's main features don't apply; clearer code path for this project's scale.
+- **2026-05-17** — Four-persona synthetic design (Power/Activator/Looker/Bouncer at 15/30/35/20%). Reason: enough latent structure to make milestones discoverable; enough adjacent overlap that the engine has to compute statistics, not trivially cluster.
