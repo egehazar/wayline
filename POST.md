@@ -48,14 +48,89 @@ Two design moments worth being honest about:
 
 After both corrections, the generator produces 370,489 events for 25,000 users in 7.2 seconds — 1.9s generating in memory, 5.3s bulk-streaming to Postgres via psycopg's `copy()`. Verifier passes all 13 sanity checks: persona distribution within 0.5pp of spec, retention rates within 1pp per persona, no orphan events. Same seed produces the same data, which matters because the engine's outputs need to be reproducible for evaluation to mean anything.
 
+## Path analysis — what order things happen in
+
+Milestone mining answers "which behaviors correlate with retention?" Path analysis answers "which ordered trajectories do?" Order matters: a user who creates a workspace, completes onboarding, then connects an integration may be a fundamentally different cohort from one who connects an integration on day 1 before touching anything else.
+
+The implementation: for each user, drop the universal `signup_completed` event (every user has it; it's useless as a prefix), then take the next 5 event names as an ordered tuple. Users with fewer than 5 post-signup events are excluded — this naturally drops Bouncers, who never engage enough to have a trajectory. Group users by sequence, compute retention rate per group, rank by lift.
+
+One design choice deserves attention. Lift here is computed against a *candidate-pool* base rate (users with ≥5 events, ~54% retention) rather than the full-population base (~33%). The full-population base would inflate every lift by ~2× — but most of that inflation captures "this user reached 5 events," which is just the engagement signal already isolated at the milestone layer via the specificity filter. The candidate-pool denominator isolates the *ordering* signal from the *engagement* signal. The two analyses do different work and shouldn't double-count.
+
+The top path is the pure Power trajectory:
+
+> `onboarding_step_completed → workspace_created → onboarding_step_completed → onboarding_step_completed → onboarding_step_completed`
+>
+> n=112, retention 81.2%, lift 1.50×
+
+That's exactly the "Power user completes all 5 onboarding steps within 24–48 hours" pattern the synthetic generator encodes. Sequences that lead with `task_created` or `comment_posted` before completing onboarding sit at or below the candidate-pool base rate — skipping ahead isn't a high-retention pattern, it's just impatience.
+
+One practical implementation note: Polars' `group_by` on `List` columns is unreliable across minor versions. The workaround is to join each list into a delimited string using the ASCII unit separator (`\x1f`) for a stable hashable key, then recover the list via `first()` in the aggregation. Event names are letters and underscores, so the unit separator never collides. Small thing, but the kind of compatibility detail that takes 10 minutes to fix once you've seen it and an hour the first time.
+
 ## LLM-drafted experiment specs
 
-(To fill in when the synthesis stage is built. How to constrain generation so specs are grounded in observed data rather than plausible-sounding hallucinations.)
+The engine surfaces *what* correlates with retention. The final stage takes the top milestones and asks Claude Sonnet 4.6 to draft what you'd actually test: hypothesis, target segment, success event, guardrail metrics, expected effect size. The output is a structured Pydantic object per spec.
+
+The default failure mode of LLM-drafted experiment specs is plausibility theater — hypotheses that sound right but reference nothing real, invented event names, retention numbers pulled from nowhere. Three defenses keep the output grounded:
+
+**Schema-level enum on `success_event`.** The Anthropic tool's JSON schema declares `success_event` as a string enum constrained to the 12 valid event names. The model literally cannot return an invalid event name — the API rejects the response. Pydantic re-validates as defense in depth.
+
+**Prompt-level correlation-vs-causation discount.** The default LLM behavior is to quote the observed lift (e.g., 3.20× for `integration_connected_within_7_days`) as the expected experimental effect. That's naive — the observed lift includes pre-existing intent (motivated users seek out integrations on their own) and selection effects (the cohort skews heavily toward the Power persona), not just behavior-to-retention causation. The prompt explicitly tells the model: *"the observed lift is correlation, not causal effect; realistic causal slice of an intervention is 10–30% of the observed gap."* With this framing, every spec lands with a discounted prediction in the 7–10 percentage-point range — about 14–20% of the raw gap — and the rationale field shows its work.
+
+**Anchored post-validation.** A heuristic check anchors on the first numeric value in `expected_effect_size` (the model's actual prediction) and flags if it's within ±5pp of the raw observed gap. That's the actual failure mode: the model quoting raw correlation as the experimental prediction.
+
+The first run of the validation heuristic flagged all 10 specs as suspect. Investigation showed every spec was applying the discount correctly — leading with a 7–10pp estimate, then citing the raw 47–54pp gap as context for the discount. The detector was scanning the whole string and treating the cited raw number as if it were the prediction. The fix was anchoring on the leading value only. One line of regex. Worth doing not because the bug was high-impact, but because a validation system that produces 100% false positives is worse than no validation system at all. The arc — wrote a check, it flagged everything, investigated, found the check was wrong, fixed the check — is the kind of detail that distinguishes real evaluation work from a checkbox.
+
+A representative spec, abbreviated:
+
+> **Milestone:** `integration_connected_within_7_days` — lift 3.20×, 72% Power-persona dominance
+>
+> **Hypothesis:** If users in their first 7 days who haven't connected an integration are shown a persistent sidebar suggestion card surfacing the four available integrations (Slack, GitHub, Google Drive, Jira) with one-click setup, plus a 48-hour email nudge, more users will fire `integration_connected` within 7 days, increasing week-4 retention.
+>
+> **Target segment:** Days 1–7 post-signup, has created a workspace or project, no `integration_connected` event yet.
+>
+> **Success event:** `integration_connected`
+>
+> **Guardrails:** week-4 churn rate among nudged users; support contact rate within 7 days; plan downgrade rate within 30 days.
+>
+> **Expected effect:** +7 to +10pp in week-4 retention — about 15–20% of the +50.8pp correlation gap, accounting for self-selection in the original "did" cohort.
+>
+> **Rationale (grounded in actual stats):** *"72.2% of the 'did' cohort are Power users with ~85% baseline retention, so a substantial portion of the gap reflects pre-existing intent rather than behavior-to-retention causation. A nudge can only convert the marginal user — likely the activator-profile users who would benefit from reduced setup friction but won't seek integrations out on their own."*
+
+That last sentence is the core of why the discount matters. The 3.20× lift looks like a 3.20× retention bump waiting to be captured. It isn't. Most of the lift is selection. The honest number is the 15–20% slice an intervention can plausibly convert. The whole synthesis stage is designed to produce that honest number rather than the marketing-deck one.
 
 ## Results
 
-(Milestones surfaced, retention lift numbers, time-to-analysis benchmarks, demo artifacts.)
+End-to-end on 25,000 synthetic users and 370,489 events generated against a four-persona behavioral model:
+
+- **24 actionable milestones** surfaced (top 10 displayed). Headline result: `completed_onboarding_step_5` at 3.37× retention lift, 60% Power-persona dominance among the "did" cohort.
+- **25 distinct activation paths** discovered via ordered-sequence analysis. Top sequence is the pure Power trajectory at 1.50× lift against the candidate-pool base.
+- **10 experiment specs** drafted by Sonnet 4.6, each grounded in the milestone's actual statistics with the correlation-vs-causation discount applied. Expected effect sizes in the 7–10pp range, 14–20% of observed correlation gaps.
+- **Persona-dominance check passes cleanly:** every top-5 actionable milestone is 57–73% Power-persona, Bouncers consistently 0%, Lookers ≤1.4%. The engine correctly isolated behaviors that discriminate *among engaged users* — not just between engaged and unengaged.
+
+**Engine wall-clock:** 1.6 seconds for the full mining + path analysis pass on 370k events. The "<30 seconds vs. multi-query SQL exploration" target leaves substantial headroom. Synthesis adds ~200 seconds for 10 sequential LLM calls; that's the bottleneck, and it parallelizes trivially if it ever needs to.
+
+**Stack:** Python + FastAPI + Polars + Postgres for the engine and API; Next.js (App Router, Server Components) + Tailwind for the dashboard; Anthropic Sonnet 4.6 for synthesis; Redis provisioned but not yet used; Docker Compose to bring up the data layer. A single FastAPI service exposes `/health /milestones /paths /specs`; the Next.js dashboard fetches all three in parallel during SSR and renders them in three labeled sections.
+
+[Insert dashboard screenshot here.]
+
+The whole thing — engine, paths, synthesis, API, dashboard — runs against the synthetic generator's seeded data, fully reproducible with `random.seed(42)`. Same seed produces the same milestones, the same paths, and (modulo the LLM's sampling) the same experiment specs.
 
 ## Limitations
 
-(Honest. To fill in.)
+A serious project should be honest about what it doesn't do. Wayline's scope is deliberately constrained.
+
+**Synthetic data only.** Real product event streams have noise, missing data, late-arriving events, schema drift, and identity-resolution problems that a generator can't fully simulate. The four-persona model is a useful caricature, not a realistic distribution — real user populations have many more latent types, with smoother and noisier boundaries between them. The "synthetic" qualifier in the project description matters when reading the results.
+
+**No real-time ingestion.** Events are batched into Postgres once by the generator. A production version would need stream ingestion (Kafka or managed equivalent), incremental computation of cohort labels, and a freshness guarantee on milestone rankings. The engine itself is fast enough to run on a schedule; the work would be in the ingestion side.
+
+**Engine is blind to anti-patterns by design.** It surfaces behaviors *positively* correlated with retention. Behaviors *negatively* correlated — friction events, error patterns, dead-end flows — are equally interesting product signals but invisible to this version. Adding negative-lift mining is a one-page change; not in scope here.
+
+**Single fixed analysis window.** Cohort labeling uses a hard-coded 21–28 day post-signup window for week-4 retention. Real analysis wants comparison across multiple windows (week 1, week 4, week 12). The engine is parameterized; no UI exposes the parameter.
+
+**Authentication scoped out.** The FastAPI surface has no auth — CORS is pinned narrowly to localhost. Local-demo surface, not a multi-tenant service.
+
+**Path analysis is shallow.** Sequences of length 5, no variants on prefix length, no parameterized "any of these N events in any order within Y days" patterns. The combinatorial space is large; this is the simplest version that still produces interpretable headline results.
+
+**Engine reads Postgres on every API call.** Mining + path analysis each cost ~1–2 seconds. Redis is provisioned but not used for caching the engine's outputs. The natural caching seam is `mine_milestones`'s raw output; not warranted at current throughput.
+
+The bigger meta-limitation is that Wayline is a *demonstration* of what a behavioral product intelligence engine looks like, not a deployed product. The honest version of the resume bullet is: *built a working prototype of an activation-mining engine, with a synthetic test bed, an evaluation methodology grounded in known persona ground truth, and an LLM synthesis stage that produces specs grounded in actual statistics rather than plausible-sounding hallucinations.* That version is what the code actually backs.
