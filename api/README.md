@@ -1,45 +1,51 @@
 # Wayline API
 
-FastAPI HTTP layer. Thin routes + serialization; analysis logic lives in `engine/`.
+FastAPI HTTP layer. Thin routes + serialization; analytical logic lives in `engine/`.
+
+See the [root README](../README.md) for the full project setup. This file documents the four endpoints.
 
 ## Run locally
 
-Prerequisites:
-
-- Dependencies installed at the repo root (`uv sync`).
-- Postgres + Redis up: `docker compose up -d` from the repo root.
-- A `.env` at the repo root (copy from `.env.example`). If `.env` is missing, the app falls back to `.env.example`.
-
-Start the dev server from inside `api/`:
+From the **project root** (not from `api/` — `main.py` uses dotted package imports):
 
 ```bash
-uv run uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uv run uvicorn api.main:app --port 8000
 ```
+
+OpenAPI docs render at `http://localhost:8000/docs`.
 
 ## Endpoints
 
-### `GET /health`
+| Method | Path           | Returns |
+|--------|----------------|---------|
+| `GET`  | `/health`      | dependency reachability (postgres, redis) |
+| `GET`  | `/milestones`  | top 12 actionable milestones with persona dominance |
+| `GET`  | `/paths`       | top 10 activation paths (5-event ordered prefixes) |
+| `GET`  | `/specs`       | parsed `data/experiment_specs.json` |
 
-Reports liveness of the API process and reachability of its dependencies.
+All endpoints are `GET`-only. CORS allows `http://localhost:3000` and `http://localhost:8000` only.
 
-Always returns HTTP 200 — this is an info endpoint, not a Kubernetes liveness probe. `status` is `"ok"` when both dependencies are reachable, `"degraded"` otherwise.
+### `/health`
 
-Sample (services up):
+Always returns HTTP 200 — info endpoint, not a Kubernetes liveness probe. `status` is `"ok"` when both dependencies are reachable, `"degraded"` otherwise.
 
 ```json
 {"status": "ok", "postgres": "connected", "redis": "connected"}
 ```
 
-Sample (services down):
+Errors are surfaced as `"error: <ExceptionClassName>"` — connection strings and credentials are never echoed.
 
-```json
-{"status": "degraded", "postgres": "error: OperationalError", "redis": "error: ConnectionError"}
-```
+### `/milestones`, `/paths`, `/specs`
 
-Error messages are exception class names only — connection strings and credentials are never echoed back.
+Engine failures return HTTP 503 with `{"detail": "error: <ExceptionClassName>"}`. `/specs` additionally returns 503 with an actionable message if `data/experiment_specs.json` is missing (`"specs not yet generated — run synthesize.py"`).
 
-Quick check:
+Compute is on-demand; no Redis caching is wired in yet. `mine_milestones`'s raw output is the natural caching seam if throughput justifies it.
+
+## Engine CLIs
+
+The engine is also runnable directly, without the HTTP layer:
 
 ```bash
-curl -s localhost:8000/health
+uv run python api/engine/run.py          # mining + paths + persona-dominance tables
+uv run python api/engine/synthesize.py   # top 10 specs → JSON + rendered text
 ```
