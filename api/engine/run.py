@@ -18,6 +18,7 @@ from milestones import (
     mine_milestones,
     persona_dominance,
 )
+from paths import compute_paths
 
 PERSONAS = ("power", "activator", "looker", "bouncer")
 
@@ -104,6 +105,28 @@ def main() -> int:
             + [f"{dom.get(p, 0.0):.1f}%" for p in PERSONAS]
         )
     _print_table(dom_rows, align=["<", ">", ">", ">", ">", ">"])
+
+    t_paths = time.perf_counter()
+    paths_df = compute_paths(users_df, events_df, prefix_length=5, min_sample=100)
+    print()
+    print("=" * 88)
+    print("  Table C — Top 10 activation paths  (prefix_length=5, min_sample=100)")
+    print("  Lift relative to base rate among users with >=5 post-signup events.")
+    print("=" * 88)
+    print(f"  {paths_df.height} unique sequences passed min_sample  "
+          f"({time.perf_counter()-t_paths:.1f}s)")
+    print()
+
+    path_rows: list[list[str]] = [["rank", "sequence", "n_users", "retain%", "lift"]]
+    for i, r in enumerate(paths_df.head(10).iter_rows(named=True), start=1):
+        path_rows.append([
+            str(i),
+            r["sequence_str"],
+            f"{r['n_users']:,}",
+            f"{r['retain_pct']*100:.1f}",
+            f"{r['lift']:.2f}x",
+        ])
+    _print_table(path_rows, align=[">", "<", ">", ">", ">"])
 
     print()
     print(f"wall clock: {time.perf_counter()-t0:.1f}s")
