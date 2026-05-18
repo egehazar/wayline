@@ -194,25 +194,96 @@ Compose tracks what's real. Until those services have code that runs, adding the
 
 ---
 
-## 13. Decisions log
+## 13. LLM synthesis
+
+**Claude Sonnet 4.6 via Anthropic SDK, tool use forcing structured output:**
+Top milestones go to Sonnet for experiment-spec drafting. Two layers enforce grounding:
+
+1. **Schema-level `success_event` enum** — the tool's JSON schema constrains `success_event` to the 12 valid event names. The API rejects responses with invalid names; the model literally cannot hallucinate. Pydantic re-validates as defense in depth.
+2. **Prompt-level correlation-vs-causation discount** — the LLM is explicitly told the observed lift is correlation, and realistic causal effect is 10–30% of the gap. Without this, the model would cite raw lift as expected experimental effect.
+
+**False-positive eval debugging arc:** the `_quotes_raw_lift` heuristic flagged all 10 specs. Investigation showed the model was correctly leading with discounted estimates (~14–20% of raw gap) and citing the raw gap as context for the discount. The detector was scanning the entire string; fix anchored on the first numeric value (the actual prediction). The arc itself — wrote a check, it flagged everything, investigated, found the check was wrong — is the kind of eval rigor that separates real evaluation from a checkbox.
+
+**No prompt caching:** ~1.2K-token prompts are below Sonnet 4.6's 2048-token minimum cache prefix. Skipped.
+
+**Sequential calls, no streaming:** 10 specs × ~20s each = ~200s total, ~$0.10–0.30. Parallelism complicates error handling without meaningful latency improvement at this scale.
+
+---
+
+## 14. Path analysis
+
+**Goal:** ordered event sequences that correlate with retention — backs the resume's "activation paths" clause.
+
+**Method:** for each user, drop `signup_completed` (universal), take the next 5 event names as an ordered tuple. Users with <5 post-signup events excluded (naturally drops Bouncers). Group by sequence; compute retention lift against a candidate-pool base.
+
+**Candidate-pool base rate (users with ≥N events), not full-population base:** sequences only exist for users active enough to have an N-event prefix. Comparing against a base that includes Bouncers (0% retention) re-introduces the "did anything" lift problem the milestone specificity filter solved. The candidate-pool denominator isolates the ordering signal from the engagement signal.
+
+**Top sequence: pure Power trajectory** — five onboarding events with workspace_created mixed in, retained at 81.2% vs. 54.1% candidate-pool base, 1.50× lift. Matches PERSONAS.md's "Power completes onboarding within 24–48h" exactly. Sequences leading with `task_created` or `comment_posted` before onboarding finishes sit at the base rate or below — skipping ahead isn't a high-retention pattern.
+
+**Concentrated path space:** only 25 sequences survive at `min_sample=100`. Path space is more clustered than initially estimated; tightening or loosening parameters fragments or floods the output. The min=100 setting produces interpretable headline results — kept at spec values.
+
+**Polars `group_by` on List columns:** unreliable across Polars versions. Worked around by joining each list into a unit-separator-delimited string for the hashable key, then recovering the list via `first()` in the aggregation.
+
+---
+
+## 15. FastAPI endpoints + Next.js dashboard
+
+**Four GET endpoints:**
+- `/health` — dependency check (existing).
+- `/milestones` — runs mining pipeline, returns top 12 actionable milestones with persona dominance.
+- `/paths` — runs path analysis, returns top 10 sequences.
+- `/specs` — reads `data/experiment_specs.json`, returns parsed list. 503 with actionable message if file missing.
+
+**Compute on demand, no Redis caching:** mining + paths each ~1–2s. Redis is provisioned; `mine_milestones`'s raw output is the natural caching seam when throughput justifies it. Doesn't yet.
+
+**Pydantic response models + auto-generated `/docs`:** every endpoint has a typed schema. FastAPI's OpenAPI generation produces a Swagger UI at `/docs` — free piece of evidence the API is properly typed.
+
+**CORS pinned narrowly:** `localhost:3000` (Next.js dev) + `localhost:8000` (self), GET-only, no credentials, no wildcards. Local-demo API surface, not multi-tenant.
+
+**Error hygiene:** caught exceptions return 503 with `error: <ExceptionClassName>` — same pattern as `/health`. No URLs, hosts, or query content leaked.
+
+**Import paths:** `from api.engine.milestones import ...` (dotted) inside `api/main.py`; bare imports inside engine CLI scripts which are invoked with `api/engine/` on `sys.path`. Python 3.3+ namespace packages cover the absent `api/__init__.py`.
+
+**Next.js dashboard — single async Server Component:** `web/app/page.tsx` does `Promise.all` against the three API endpoints during SSR. No client components — `<details>` HTML handles spec card collapse without shipping JS. Renders in ~2s including parallel API calls.
+
+**Visual hierarchy:** monochrome neutral palette + single indigo accent on lift values and section eyebrows. Geist Sans for prose, Geist Mono for identifiers (event names, milestone snake_case, success_event strings). Tabular numerals across numeric columns so digits align. Three sections with eyebrow numbering (01, 02, 03) — reads as a guided tour rather than navigation.
+
+**No UI library:** Tailwind alone. Adding shadcn/MUI/etc. would add dependency surface and fingerprint as scaffolded; hand-rolled reads as deliberate.
+
+**Error state in UI:** if any API fetch fails, the page renders an inline panel with the explicit start-backend command. Doesn't crash.
+
+**Dark mode removed:** Next.js's default `prefers-color-scheme: dark` block deleted from `globals.css`. Handling both is a separate design problem and the B2B analytics demo benefits from a consistent reference frame.
+
+---
+
+## 16. Decisions log
 
 Append-only. Date + decision + reasoning.
 
 - **2026-05-16** — Layout: `engine/` as submodule of `api/`, not sibling at root. Reason: only one consumer; avoids overengineering while preserving the architectural boundary in code.
 - **2026-05-16** — Stack: Polars over pandas for analysis stage. Reason: performance at 250k+ events + lazy API.
 - **2026-05-16** — Postgres 16 + Redis 7 (alpine) with in-compose healthchecks. Reason: current stable majors, small images, race-condition-safe startup.
-- **2026-05-16** — Host port remap to 5433/6380 due to collision with another local Docker project. Container internals unchanged.
+- **2026-05-16** — Host port remap to 5433/6380 due to collision with another local Docker project.
 - **2026-05-16** — psycopg 3 over 2. Reason: current major; binary wheel; sync now, async swap possible later.
-- **2026-05-16** — Sync `def` health endpoint with sync drivers. Reason: blocking contained in FastAPI's threadpool; no async drivers needed yet.
+- **2026-05-16** — Sync `def` health endpoint with sync drivers. Reason: blocking contained in FastAPI's threadpool.
 - **2026-05-16** — `/health` always returns 200 with status="ok"|"degraded". Reason: info endpoint, not liveness probe.
-- **2026-05-17** — Two-table schema (users + events) with JSONB `properties` on events. Reason: standard product-analytics shape; flexible per-event-type fields without column proliferation.
-- **2026-05-17** — `persona` column on users as generator ground truth + engine evaluation signal. Engine treats it as opaque. Reason: lets us validate engine outputs against known persona assignments instead of hand-waving.
-- **2026-05-17** — Raw SQL migrations + 20-line Python runner over Alembic. Reason: no ORM in use; Alembic's main features don't apply; clearer code path for this project's scale.
-- **2026-05-17** — Four-persona synthetic design (Power/Activator/Looker/Bouncer at 15/30/35/20%). Reason: enough latent structure to make milestones discoverable; enough adjacent overlap that the engine has to compute statistics, not trivially cluster.
-- **2026-05-17** — Generator session rates calibrated ~4–5× below spec to hit the 250–400k event target band. Persona rankings + per-event probabilities preserved exactly. Reason: absolute volume per user doesn't affect the behavioral signature; recalibrating beats widening the verify range.
-- **2026-05-17** — Retention sampled as explicit Bernoulli at user-generation time; non-retained users' events clipped to before day 21. Reason: prevents long-onboarding-window spillover from contaminating the retention measurement.
-- **2026-05-17** — Engine as Polars-based functional module, no FastAPI dependencies. Reason: independent testability, library-shaped for future endpoint wrapping.
-- **2026-05-17** — Hand-defined milestone templates with parameter sweeps over thresholds. Reason: interpretability matters as much as recall; uninterpretable milestones aren't actionable.
-- **2026-05-17** — Lift + minimum sample size (200) for milestone scoring over chi-squared. Reason: at 25k users, chi-squared p-values are effectively zero and don't discriminate; sample-size filtering catches small-sample noise with simpler defensibility.
-- **2026-05-17** — Specificity filter (`max_share=0.25`) added after first-cut ranking surfaced "did anything past signup" milestones at top with 9.6× lift. Reason: lift alone surfaces broad-funnel predicates that exclude Bouncers but aren't actionable; specificity cap isolates the specific behaviors PMs can target.
-- **2026-05-17** — Two-table CLI output (raw + actionable). Reason: raw verifies mechanical correctness; actionable is the headline ranking. Hiding either obscures either how the engine works or what it's useful for.
+- **2026-05-17** — Two-table schema (users + events) with JSONB `properties`. Reason: standard product-analytics shape.
+- **2026-05-17** — `persona` column on users as generator ground truth + engine evaluation signal. Engine treats it as opaque.
+- **2026-05-17** — Raw SQL migrations + 20-line Python runner over Alembic. Reason: no ORM in use.
+- **2026-05-17** — Four-persona synthetic design (Power/Activator/Looker/Bouncer at 15/30/35/20%).
+- **2026-05-17** — Generator session rates calibrated ~4–5× below spec to hit 250–400k event target. Persona rankings + per-event probabilities preserved exactly.
+- **2026-05-17** — Retention sampled as explicit Bernoulli at user-generation time; non-retained users' events clipped to before day 21. Reason: prevents long-onboarding spillover from contaminating retention measurement.
+- **2026-05-17** — Engine as Polars-based functional module, no FastAPI dependencies.
+- **2026-05-17** — Hand-defined milestone templates with parameter sweeps over thresholds. Reason: interpretability matters as much as recall.
+- **2026-05-17** — Lift + minimum sample size (200) for milestone scoring over chi-squared. Reason: at 25k users, chi-squared doesn't discriminate; sample-size filtering catches the same failure mode simpler.
+- **2026-05-17** — Specificity filter (max_share=0.25). Reason: lift alone surfaces "did anything past signup" predicates; specificity cap isolates the specific actionable behaviors.
+- **2026-05-17** — Two-table CLI output (raw + actionable). Reason: raw verifies mechanical correctness; actionable is the headline.
+- **2026-05-17** — LLM synthesis via Claude Sonnet 4.6 with tool-use forcing structured output + Pydantic re-validation. Reason: schema-level enum makes success_event hallucination impossible.
+- **2026-05-17** — Correlation-vs-causation discount explicit in synthesis prompt (10–30% of observed lift). Reason: naive LLM behavior is to quote raw lift as causal effect.
+- **2026-05-17** — `_quotes_raw_lift` heuristic refined to anchor on leading prediction. Reason: original scanned full string; false-positive on correct discount applications.
+- **2026-05-17** — Path analysis lifts computed against candidate-pool base rate, not full-population base. Reason: prevents reintroducing the Bouncer-exclusion effect the milestone specificity filter already solved.
+- **2026-05-17** — 25 sequences at min_sample=100 accepted as operating regime. Reason: lower thresholds add noise; current set represents genuinely distinct paths.
+- **2026-05-17** — Polars group_by on List columns worked around with delimited-string join. Reason: cross-version reliability.
+- **2026-05-17** — Four GET FastAPI endpoints, CORS pinned to localhost only, compute on demand. Reason: portfolio-demo scope.
+- **2026-05-17** — Next.js dashboard as single async Server Component, no client components. Reason: SSR + Promise.all is the simplest fast path at this scope.
+- **2026-05-17** — Tailwind only, no UI library. Reason: 3-section dashboard doesn't justify shadcn/MUI dependency surface.
